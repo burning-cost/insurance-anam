@@ -34,10 +34,17 @@ class ExUActivation(nn.Module):
 
     More expressive than ReLU for capturing sharp transitions in shape
     functions, at the cost of less smooth curves and harder training.
+
+    This module replaces both the linear layer and the activation in one
+    step. It does not use a preceding nn.Linear — the weights w and biases
+    b are learned here directly. The output dimension is out_features per
+    input feature, then summed by the trailing relu-clamp.
     """
 
     def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
         self.weights = nn.Parameter(torch.empty(in_features, out_features))
         self.biases = nn.Parameter(torch.empty(in_features))
         nn.init.normal_(self.weights, mean=4.0, std=0.5)
@@ -49,7 +56,10 @@ class ExUActivation(nn.Module):
         shifted = x - self.biases  # (batch, in_features)
         # exu per-feature: different from a standard linear layer
         # each feature i maps to out_features outputs
-        return torch.relu(shifted.unsqueeze(-1) * self.weights.unsqueeze(0)).squeeze(-1)
+        # result shape: (batch, in_features, out_features) -> (batch, out_features)
+        out = torch.relu(shifted.unsqueeze(-1) * self.weights.unsqueeze(0))
+        # sum over in_features to produce (batch, out_features)
+        return out.sum(dim=1)
 
 
 class FeatureNetwork(nn.Module):
@@ -66,6 +76,9 @@ class FeatureNetwork(nn.Module):
         Width of each hidden layer. E.g. [64, 32] gives two hidden layers.
     activation:
         'relu' (default) or 'exu'. ReLU is more stable; ExU more expressive.
+        When 'exu' is specified, ExUActivation replaces the nn.Linear +
+        nn.ReLU pair for each hidden layer (ExU fuses the linear transform
+        into the activation).
     monotonicity:
         'increasing', 'decreasing', or 'none'. Enforced by projecting
         weight matrices onto the non-negative (or non-positive) orthant
@@ -95,18 +108,21 @@ class FeatureNetwork(nn.Module):
         in_dim = 1
 
         for i, out_dim in enumerate(hidden_sizes):
-            linear = nn.Linear(in_dim, out_dim)
-            # Weight initialisation: smaller init stabilises training with
-            # many subnetworks summing together.
-            nn.init.xavier_uniform_(linear.weight, gain=0.5)
-            nn.init.zeros_(linear.bias)
-            layers.append(linear)
-
             if activation == "relu":
+                # Standard linear + ReLU pair.
+                linear = nn.Linear(in_dim, out_dim)
+                # Weight initialisation: smaller init stabilises training with
+                # many subnetworks summing together.
+                nn.init.xavier_uniform_(linear.weight, gain=0.5)
+                nn.init.zeros_(linear.bias)
+                layers.append(linear)
                 layers.append(nn.ReLU())
             elif activation == "exu":
-                # ExU replaces ReLU but needs its own layer wrapper
-                layers.append(nn.ReLU())  # simplified: use ReLU after linear
+                # P0-3 fix: wire up ExUActivation properly.
+                # ExU fuses the linear transform into the activation — no
+                # preceding nn.Linear. The ExUActivation module takes
+                # (in_features, out_features) and outputs (batch, out_features).
+                layers.append(ExUActivation(in_features=in_dim, out_features=out_dim))
             else:
                 raise ValueError(f"Unknown activation: {activation!r}")
 
@@ -158,6 +174,11 @@ class FeatureNetwork(nn.Module):
                     module.weight.data.clamp_(min=0.0)
                 elif self.monotonicity == "decreasing":
                     module.weight.data.clamp_(max=0.0)
+            elif isinstance(module, ExUActivation):
+                if self.monotonicity == "increasing":
+                    module.weights.data.clamp_(min=0.0)
+                elif self.monotonicity == "decreasing":
+                    module.weights.data.clamp_(max=0.0)
 
     def feature_range(
         self, x_min: float, x_max: float, n_points: int = 200

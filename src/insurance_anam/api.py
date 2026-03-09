@@ -26,6 +26,7 @@ normalize=True (default).
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
@@ -115,14 +116,18 @@ class ANAM:
     ) -> None:
         self.feature_configs = feature_configs
         self.feature_names = feature_names
-        self.categorical_features = categorical_features or []
-        self.monotone_increasing = monotone_increasing or []
-        self.monotone_decreasing = monotone_decreasing or []
+        # Store exactly as passed — no coercion to [] here.
+        # sklearn clone() checks that get_params() round-trips through __init__
+        # exactly. Coercing None->[] would break that invariant.
+        # Defaults are applied at point-of-use in fit() and _build_feature_configs().
+        self.categorical_features = categorical_features
+        self.monotone_increasing = monotone_increasing
+        self.monotone_decreasing = monotone_decreasing
         self.link = link
         self.loss = loss
         self.tweedie_p = tweedie_p
-        self.interaction_pairs = interaction_pairs or []
-        self.hidden_sizes = hidden_sizes or [64, 32]
+        self.interaction_pairs = interaction_pairs
+        self.hidden_sizes = hidden_sizes
         self.n_epochs = n_epochs
         self.batch_size = batch_size
         self.learning_rate = learning_rate
@@ -140,8 +145,14 @@ class ANAM:
         self.history_: Optional[TrainingHistory] = None
         self.feature_names_in_: Optional[List[str]] = None
         self._continuous_col_indices: List[int] = []
+        # P0-1 fix: track both the cached shapes and the n_points used to
+        # build them so we can detect stale cache on different n_points.
         self._shapes_cache: Optional[Dict[str, ShapeFunction]] = None
+        self._shapes_cache_n_points: Optional[int] = None
         self._X_train_scaled: Optional[np.ndarray] = None
+        # P0-2 fix: per-feature category remapping tables set during fit().
+        # Maps feature name -> array where remap[original_code] = new_code.
+        self._cat_remap_: Dict[str, np.ndarray] = {}
 
     def fit(
         self,
@@ -168,8 +179,15 @@ class ANAM:
         X_arr, y_arr, w_arr, names = self._validate_input(X, y, sample_weight)
         self.feature_names_in_ = names
 
-        # Build feature configs if not provided
+        # Build feature configs if not provided. Also populates self._cat_remap_
+        # for any categorical columns that are not zero-indexed consecutive ints.
         feat_configs = self.feature_configs or self._build_feature_configs(names, X_arr)
+
+        # P0-2 fix: apply category remapping to training data so that the
+        # trainer and scaler see zero-indexed codes, matching the embedding
+        # table sizes that _build_feature_configs computed.
+        if self._cat_remap_:
+            X_arr = self._apply_cat_remap(X_arr)
 
         # Identify continuous column indices for normalisation
         self._continuous_col_indices = [
@@ -192,7 +210,7 @@ class ANAM:
 
         # Build interaction configs
         interaction_configs: List[InteractionConfig] = []
-        for fi, fj in self.interaction_pairs:
+        for fi, fj in (self.interaction_pairs or []):
             interaction_configs.append(
                 InteractionConfig(feature_i=fi, feature_j=fj)
             )
@@ -202,7 +220,7 @@ class ANAM:
             feature_configs=feat_configs,
             link=self.link,
             interaction_configs=interaction_configs,
-            hidden_sizes=self.hidden_sizes,
+            hidden_sizes=self.hidden_sizes or [64, 32],
         )
 
         # Build trainer
@@ -248,6 +266,7 @@ class ANAM:
         self._check_fitted()
 
         X_arr = self._to_array(X)
+        X_arr = self._apply_cat_remap(X_arr)
         X_arr = self._apply_scaling(X_arr)
 
         if exposure is not None:
@@ -306,17 +325,22 @@ class ANAM:
 
         Returns a dict mapping feature name to ShapeFunction. Shape
         functions are evaluated over the observed training data range.
+
+        The cache is keyed on n_points. Calling with a different n_points
+        than the cached value discards the stale cache and recomputes.
         """
         self._check_fitted()
         assert self._X_train_scaled is not None
 
-        if self._shapes_cache is None:
+        # P0-1 fix: invalidate cache when n_points changes.
+        if self._shapes_cache is None or self._shapes_cache_n_points != n_points:
             self._shapes_cache = extract_shape_functions(
                 self.model_,
                 self._X_train_scaled,
                 n_points=n_points,
                 category_labels=category_labels,
             )
+            self._shapes_cache_n_points = n_points
         return self._shapes_cache
 
     def feature_importance(self) -> pl.DataFrame:
@@ -332,11 +356,24 @@ class ANAM:
         ).sort("importance", descending=True)
 
     def get_params(self, deep: bool = True) -> Dict[str, Any]:
-        """sklearn get_params for grid search compatibility."""
+        """sklearn get_params for grid search compatibility.
+
+        Returns ALL constructor parameters — including structural ones
+        (feature_configs, interaction_pairs, etc.) — so that
+        sklearn.base.clone() can reconstruct a functionally equivalent
+        model.
+        """
+        # P0-4 fix: include all constructor parameters, not just numerical ones.
         return {
+            "feature_configs": self.feature_configs,
+            "feature_names": self.feature_names,
+            "categorical_features": self.categorical_features,
+            "monotone_increasing": self.monotone_increasing,
+            "monotone_decreasing": self.monotone_decreasing,
             "link": self.link,
             "loss": self.loss,
             "tweedie_p": self.tweedie_p,
+            "interaction_pairs": self.interaction_pairs,
             "hidden_sizes": self.hidden_sizes,
             "n_epochs": self.n_epochs,
             "batch_size": self.batch_size,
@@ -377,6 +414,27 @@ class ANAM:
         X_norm[:, cont_cols] = self.scaler_.transform(X_arr[:, cont_cols].astype(np.float64)).astype(np.float32)
         return X_norm
 
+    def _apply_cat_remap(self, X_arr: np.ndarray) -> np.ndarray:
+        """Apply stored category remappings.
+
+        P0-2 fix: if any categorical features were remapped during fit
+        (because they were not zero-indexed consecutive integers), apply
+        the same remapping here. Called both during fit() (on training
+        data) and during predict() (on new data) so that codes always
+        align with the trained embedding table.
+        """
+        if not self._cat_remap_:
+            return X_arr
+        if self.feature_names_in_ is None:
+            return X_arr
+        X_out = X_arr.copy()
+        for feat_name, remap in self._cat_remap_.items():
+            if feat_name in self.feature_names_in_:
+                col_idx = self.feature_names_in_.index(feat_name)
+                codes = X_out[:, col_idx].astype(int)
+                X_out[:, col_idx] = remap[codes].astype(X_out.dtype)
+        return X_out
+
     def _validate_input(
         self,
         X: Union[np.ndarray, pl.DataFrame],
@@ -409,11 +467,42 @@ class ANAM:
     def _build_feature_configs(
         self, names: List[str], X_arr: np.ndarray
     ) -> List[FeatureConfig]:
-        """Auto-construct FeatureConfig list from names and constraints."""
+        """Auto-construct FeatureConfig list from names and constraints.
+
+        P0-2 fix: for categorical features, validate that column values are
+        zero-indexed consecutive integers. If not, auto-remap and warn. The
+        remap is stored in self._cat_remap_ and applied to the training
+        array in fit() before the scaler and trainer receive it.
+        """
         configs: List[FeatureConfig] = []
+        self._cat_remap_ = {}
+
         for i, name in enumerate(names):
-            if name in self.categorical_features:
-                n_cats = int(np.unique(X_arr[:, i].astype(int)).max()) + 1
+            if name in (self.categorical_features or []):
+                col = X_arr[:, i].astype(int)
+                unique_vals = np.unique(col)
+                expected = np.arange(len(unique_vals))
+                if not np.array_equal(unique_vals, expected):
+                    # Not zero-indexed consecutive integers. Auto-remap.
+                    warnings.warn(
+                        f"Categorical feature '{name}' has values {unique_vals.tolist()} "
+                        f"which are not zero-indexed consecutive integers. "
+                        f"Auto-remapping to 0..{len(unique_vals) - 1}. "
+                        f"The same remapping will be applied at predict time. "
+                        f"If you rely on specific category indices in post-hoc analysis, "
+                        f"remap the column yourself before passing to fit().",
+                        UserWarning,
+                        stacklevel=3,
+                    )
+                    # Build a lookup array: remap[original_code] = new_code.
+                    max_orig = int(unique_vals.max())
+                    remap = np.full(max_orig + 1, -1, dtype=int)
+                    for new_code, orig_code in enumerate(unique_vals):
+                        remap[orig_code] = new_code
+                    self._cat_remap_[name] = remap
+                    col = remap[col]
+
+                n_cats = int(col.max()) + 1
                 configs.append(
                     FeatureConfig(
                         name=name,
@@ -423,9 +512,9 @@ class ANAM:
                 )
             else:
                 mono: Literal["increasing", "decreasing", "none"] = "none"
-                if name in self.monotone_increasing:
+                if name in (self.monotone_increasing or []):
                     mono = "increasing"
-                elif name in self.monotone_decreasing:
+                elif name in (self.monotone_decreasing or []):
                     mono = "decreasing"
                 configs.append(
                     FeatureConfig(
