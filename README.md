@@ -1,5 +1,7 @@
 # insurance-anam
 
+![Tests](https://github.com/burning-cost/insurance-anam/actions/workflows/ci.yml/badge.svg)
+
 Actuarial Neural Additive Model for insurance pricing. A production-quality Python library implementing the ANAM architecture from [Laub, Pho, Wong (2025)](https://arxiv.org/abs/2509.08467).
 
 ---
